@@ -16,19 +16,26 @@ use barter::{
     },
     strategy::example::{Config as StrategyConfig, RSIStrategy},
 };
-use barter_data::event::{DataKind, MarketEvent};
 use barter_data::subscription::candle::Candle;
+use barter_data::{
+    event::{DataKind, MarketEvent},
+    ExchangeWsStream,
+};
 use barter_integration::model::{Exchange, Instrument, InstrumentKind, Market};
-use chrono::Utc;
+use chrono::{DateTime, TimeZone, Utc};
+use csv;
 use parking_lot::Mutex;
+use serde::Deserialize;
 use std::{collections::HashMap, fs, sync::Arc};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 const DATA_HISTORIC_CANDLES_1H: &str = "examples/data/candles_1h.json";
+const DATA_CSV_HISTORIC_CANDLES_1H: &str = "examples/data/BTCUSDT-5m-2022-01.csv";
 
 #[tokio::main]
 async fn main() {
+    let data = load_csv_market_event_candles();
     // Create channel to distribute Commands to the Engine & it's Traders (eg/ Command::Terminate)
     let (_command_tx, command_rx) = mpsc::channel(20);
 
@@ -76,7 +83,7 @@ async fn main() {
             .event_tx(event_tx.clone())
             .portfolio(Arc::clone(&portfolio))
             .data(historical::MarketFeed::new(
-                load_json_market_event_candles().into_iter(),
+                data,
             ))
             .strategy(RSIStrategy::new(StrategyConfig { rsi_period: 14 }))
             .execution(SimulatedExecution::new(ExecutionConfig {
@@ -129,6 +136,62 @@ fn load_json_market_event_candles() -> Vec<MarketEvent<DataKind>> {
             kind: DataKind::Candle(candle),
         })
         .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceCandle {
+    open_time: u64,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+    close_time: u64,
+    quote_asset_volume: f64,
+    number_of_trades: u64,
+    taker_buy_base_asset_volume: f64,
+    taker_buy_quote_asset_volume: f64,
+    ignore: f64,
+}
+
+impl Into<Candle> for BinanceCandle {
+    fn into(self) -> Candle {
+        let close_time = DateTime::<Utc>::from_utc(
+            chrono::NaiveDateTime::from_timestamp_opt(self.close_time as i64 / 1000, 0).unwrap(),
+            Utc,
+        );
+
+        Candle {
+            close_time,
+            open: self.open,
+            high: self.high,
+            low: self.low,
+            close: self.close,
+            volume: self.volume,
+            trade_count: self.number_of_trades,
+        }
+    }
+}
+
+fn load_csv_market_event_candles() -> Vec<MarketEvent<DataKind>> {
+    let mut candles = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_path(DATA_CSV_HISTORIC_CANDLES_1H)
+        .expect("fuck csv");
+
+    let mut ret = Vec::new();
+    for result in candles.deserialize() {
+        let record: BinanceCandle = result.unwrap();
+        println!("{:?}", record);
+        ret.push(MarketEvent {
+            exchange_time: Utc.timestamp_millis_opt(record.close_time as i64).unwrap(),
+            received_time: Utc::now(),
+            exchange: Exchange::from("binance"),
+            instrument: Instrument::from(("btc", "usdt", InstrumentKind::Spot)),
+            kind: DataKind::Candle(record.into()),
+        });
+    }
+    ret
 }
 
 // Listen to Events that occur in the Engine. These can be used for updating event-sourcing,
